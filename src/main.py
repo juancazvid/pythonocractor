@@ -170,8 +170,17 @@ async def main() -> None:
         process_only_clean = actor_input.get('processOnlyClean', False)
         
         # Open datasets
-        source_dataset = await Actor.open_dataset(dataset_id)
-        default_dataset = await Actor.open_dataset()
+        try:
+            # First try as an ID
+            source_dataset = await Actor.open_dataset(id=dataset_id)
+        except Exception:
+            # If that fails, try as a name
+            try:
+                source_dataset = await Actor.open_dataset(name=dataset_id)
+            except Exception as e:
+                raise ValueError(f'Could not open dataset with ID/name: {dataset_id}. Error: {e}')
+        
+        default_dataset = await Actor.open_dataset()  # Default dataset doesn't need parameters
         
         # Get dataset info
         info = await source_dataset.get_info()
