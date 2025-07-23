@@ -184,7 +184,7 @@ async def main() -> None:
         
         # Get dataset info
         info = await source_dataset.get_info()
-        item_count = info.item_count if info else 0
+        item_count = info.get('itemCount', 0) if info else 0
         
         Actor.log.info(f'Found {item_count} items in dataset. Initializing OCR processor...')
         
@@ -212,15 +212,15 @@ async def main() -> None:
                 Actor.log.info(f'Fetching batch (limit: {batch_size}, offset: {offset})...')
                 
                 # Fetch batch
-                list_items_params = {
+                data_params = {
                     'limit': batch_size,
                     'offset': offset
                 }
                 if process_only_clean:
-                    list_items_params['clean'] = True
+                    data_params['clean'] = True
                 
-                items = await source_dataset.list_items(**list_items_params)
-                batch = items.items
+                result = await source_dataset.get_data(**data_params)
+                batch = result.get('items', [])
                 
                 if not batch:
                     Actor.log.info('All items processed.')
