@@ -19,11 +19,11 @@ class OCRProcessor:
     def __init__(self, lang: str = 'eng'):
         """Initialize OCR processor with language settings."""
         self.lang = lang
-        # Configure Tesseract for email extraction
+        # Configure Tesseract - using default PSM for better multi-line support
+        # Character whitelist is kept for email extraction compatibility
         self.custom_config = (
-            '--psm 7 '  # Treat image as single text line
             '-c tessedit_char_whitelist="0123456789abcdefghijklmnopqrstuvwxyz'
-            'ABCDEFGHIJKLMNOPQRSTUVWXYZ@.-_+"'
+            'ABCDEFGHIJKLMNOPQRSTUVWXYZ@.-_+ \n"'
         )
     
     def preprocess_image(self, image: Image.Image) -> Image.Image:
@@ -32,7 +32,11 @@ class OCRProcessor:
         if image.width > 2000:
             ratio = 2000 / image.width
             new_size = (2000, int(image.height * ratio))
-            image = image.resize(new_size, Image.Resampling.LANCZOS)
+            # Handle both old and new Pillow API
+            try:
+                image = image.resize(new_size, Image.Resampling.LANCZOS)
+            except AttributeError:
+                image = image.resize(new_size, Image.LANCZOS)
         
         # Convert to grayscale
         image = ImageOps.grayscale(image)
@@ -71,12 +75,16 @@ class OCRProcessor:
 async def download_image(session: aiohttp.ClientSession, url: str) -> Optional[bytes]:
     """Download image from URL asynchronously."""
     try:
-        async with session.get(url) as response:
+        timeout = aiohttp.ClientTimeout(total=30)  # 30 second timeout
+        async with session.get(url, timeout=timeout) as response:
             if response.status == 200:
                 return await response.read()
             else:
                 Actor.log.warning(f'Failed to fetch image. Status: {response.status}', extra={'url': url})
                 return None
+    except asyncio.TimeoutError:
+        Actor.log.warning(f'Image download timed out after 30 seconds', extra={'url': url})
+        return None
     except Exception as e:
         Actor.log.exception(f'Error downloading image: {e}', extra={'url': url})
         return None
@@ -99,9 +107,16 @@ async def process_batch(
             if url and isinstance(url, str):
                 download_tasks.append(download_image(session, url))
             else:
-                download_tasks.append(asyncio.create_task(asyncio.coroutine(lambda: None)()))
+                download_tasks.append(None)
         
-        image_bytes_list = await asyncio.gather(*download_tasks)
+        # Process tasks, replacing None with None in results
+        image_bytes_list = []
+        for task in download_tasks:
+            if task is None:
+                image_bytes_list.append(None)
+            else:
+                result = await task
+                image_bytes_list.append(result)
     
     # Process OCR in thread pool
     loop = asyncio.get_event_loop()
@@ -160,6 +175,14 @@ async def main() -> None:
         
         # Initialize OCR processor and thread pool
         ocr_processor = OCRProcessor(lang=lang)
+        
+        # Verify Tesseract is installed
+        try:
+            version = pytesseract.get_tesseract_version()
+            Actor.log.info(f'Tesseract version: {version}')
+        except pytesseract.TesseractNotFoundError:
+            raise RuntimeError('Tesseract is not installed or not in PATH')
+        
         executor = ThreadPoolExecutor(max_workers=15)  # Increased from JS version's 5
         
         Actor.log.info(f'OCR processor initialized for language: {lang}')
