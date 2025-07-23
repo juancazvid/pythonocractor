@@ -184,7 +184,23 @@ async def main() -> None:
         
         # Get dataset info
         info = await source_dataset.get_info()
-        item_count = info.get('itemCount', 0) if info else 0
+        
+        # Debug: log available attributes
+        if info:
+            Actor.log.debug(f'DatasetMetadata attributes: {dir(info)}')
+        
+        # Try to get item count - common patterns are item_count or itemCount
+        item_count = 0
+        if info:
+            if hasattr(info, 'item_count'):
+                item_count = info.item_count
+            elif hasattr(info, 'itemCount'):
+                item_count = info.itemCount
+            elif hasattr(info, 'items_count'):
+                item_count = info.items_count
+            else:
+                # Log warning and continue without item count
+                Actor.log.warning('Could not find item count attribute in dataset info')
         
         Actor.log.info(f'Found {item_count} items in dataset. Initializing OCR processor...')
         
