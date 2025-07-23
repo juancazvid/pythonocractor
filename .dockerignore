@@ -1,6 +1,54 @@
-__pycache__/
-*.pyc
-.git
-storage/
+# Git
+.git/
+.gitignore
+
+# Apify storage
 apify_storage/
+storage/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
 .env
+.venv
+env/
+venv/
+ENV/
+
+# IDE and editors
+.idea/
+.vscode/
+.zed/
+*.swp
+*.swo
+.DS_Store
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Documentation
+docs/
+*.md
+
+# Local development files
+.mise.toml
+.nvim.lua
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Logs
+*.log
+
+# OS files
+Thumbs.db
