@@ -100,6 +100,7 @@ Additional languages can be added by modifying the Dockerfile to install extra T
 
 - **Python Version**: 3.13
 - **OCR Engine**: Tesseract with native Python bindings (pytesseract)
+- **HTTP Client**: httpx (async, included with Apify SDK)
 - **Concurrency**: 15 parallel OCR workers (3x more than JS version)
 - **Memory Management**: Efficient streaming processing of images
 - **HTTP Timeout**: 30-second timeout for image downloads
