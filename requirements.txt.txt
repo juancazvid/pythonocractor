@@ -1,0 +1,9 @@
+# Apify SDK for Actor development
+apify < 3.0
+
+# OCR and image processing
+pytesseract==0.3.10
+Pillow==10.3.0
+
+# Async HTTP client for concurrent downloads
+aiohttp==3.9.5

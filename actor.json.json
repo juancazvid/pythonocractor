@@ -1,0 +1,12 @@
+{
+    "actorSpecification": 1,
+    "name": "image-ocr-extractor-python",
+    "title": "Image OCR Extractor (Python)",
+    "description": "Extracts text from images in a dataset using OCR - Python optimized version.",
+    "version": "1.0.0",
+    "meta": {
+        "templateId": "python-start"
+    },
+    "input": "./input_schema.json",
+    "dockerfile": "../Dockerfile"
+}
