@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from typing import Any, Dict, List, Optional
 
-import aiohttp
+import httpx
 import pytesseract
 from PIL import Image, ImageEnhance, ImageOps
 from apify import Actor
@@ -72,17 +72,16 @@ class OCRProcessor:
             return ''
 
 
-async def download_image(session: aiohttp.ClientSession, url: str) -> Optional[bytes]:
+async def download_image(client: httpx.AsyncClient, url: str) -> Optional[bytes]:
     """Download image from URL asynchronously."""
     try:
-        timeout = aiohttp.ClientTimeout(total=30)  # 30 second timeout
-        async with session.get(url, timeout=timeout) as response:
-            if response.status == 200:
-                return await response.read()
-            else:
-                Actor.log.warning(f'Failed to fetch image. Status: {response.status}', extra={'url': url})
-                return None
-    except asyncio.TimeoutError:
+        response = await client.get(url, timeout=30.0)
+        if response.status_code == 200:
+            return response.content
+        else:
+            Actor.log.warning(f'Failed to fetch image. Status: {response.status_code}', extra={'url': url})
+            return None
+    except httpx.TimeoutException:
         Actor.log.warning(f'Image download timed out after 30 seconds', extra={'url': url})
         return None
     except Exception as e:
@@ -100,12 +99,12 @@ async def process_batch(
     results = []
     
     # Download all images concurrently
-    async with aiohttp.ClientSession() as session:
+    async with httpx.AsyncClient() as client:
         download_tasks = []
         for item in items:
             url = item.get(image_field)
             if url and isinstance(url, str):
-                download_tasks.append(download_image(session, url))
+                download_tasks.append(download_image(client, url))
             else:
                 download_tasks.append(None)
         
