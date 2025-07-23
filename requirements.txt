@@ -5,5 +5,5 @@ apify < 3.0
 pytesseract==0.3.10
 Pillow==11.0.0  # Updated for Python 3.13 compatibility
 
-# Async HTTP client for concurrent downloads
-aiohttp==3.9.5
+# HTTP client - using httpx which is already included with apify
+# No need for aiohttp since httpx is async and included
