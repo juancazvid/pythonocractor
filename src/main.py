@@ -56,6 +56,13 @@ class OCRProcessor:
             # Open image
             image = Image.open(BytesIO(image_bytes))
             
+            # Convert RGBA to RGB if needed
+            if image.mode == 'RGBA':
+                # Create a white background
+                background = Image.new('RGB', image.size, (255, 255, 255))
+                background.paste(image, mask=image.split()[3])  # Use alpha channel as mask
+                image = background
+            
             # Preprocess
             processed_image = self.preprocess_image(image)
             
@@ -98,24 +105,24 @@ async def process_batch(
     """Process a batch of items with concurrent image downloading and OCR."""
     results = []
     
+    # Helper function to return None
+    async def return_none():
+        return None
+    
     # Download all images concurrently
-    async with httpx.AsyncClient() as client:
+    # Increase connection pool size for better concurrency
+    limits = httpx.Limits(max_keepalive_connections=20, max_connections=30)
+    async with httpx.AsyncClient(limits=limits) as client:
         download_tasks = []
         for item in items:
             url = item.get(image_field)
             if url and isinstance(url, str):
                 download_tasks.append(download_image(client, url))
             else:
-                download_tasks.append(None)
+                download_tasks.append(return_none())
         
-        # Process tasks, replacing None with None in results
-        image_bytes_list = []
-        for task in download_tasks:
-            if task is None:
-                image_bytes_list.append(None)
-            else:
-                result = await task
-                image_bytes_list.append(result)
+        # Wait for all downloads to complete concurrently
+        image_bytes_list = await asyncio.gather(*download_tasks)
     
     # Process OCR in thread pool
     loop = asyncio.get_event_loop()
