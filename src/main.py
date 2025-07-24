@@ -204,7 +204,7 @@ async def main() -> None:
         Actor.log.info(f'OCR processor initialized for language: {lang}')
         
         total_processed = 0
-        batch_size = 500
+        batch_size = 30
         
         try:
             # Process dataset in batches
