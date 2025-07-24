@@ -119,7 +119,8 @@ class OCRProcessor:
             text = pytesseract.image_to_string(
                 processed_image,
                 lang=self.lang,
-                config=config
+                config=config,
+                timeout=15
             )
             
             # Quick validation - if we got very little text and image was not preprocessed, 
@@ -133,7 +134,8 @@ class OCRProcessor:
                 text = pytesseract.image_to_string(
                     enhanced,
                     lang=self.lang,
-                    config=self.dense_config
+                    config=self.dense_config,
+                    timeout=15
                 )
             
             return text.strip()
