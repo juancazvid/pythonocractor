@@ -1,11 +1,12 @@
-"""OCR text extraction from images in Apify datasets - Optimized version."""
+"""OCR text extraction from images in Apify datasets - Thread-safe version."""
 
 from __future__ import annotations
 
 import asyncio
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -15,8 +16,12 @@ from PIL import Image, ImageEnhance, ImageOps, ImageStat
 from apify import Actor
 
 
+# Global lock for thread-safe Tesseract access
+TESSERACT_LOCK = threading.Lock()
+
+
 class OCRProcessor:
-    """Handles OCR processing with optimized image preprocessing."""
+    """Handles OCR processing with thread-safe image preprocessing."""
     
     def __init__(self, lang: str = 'eng'):
         """Initialize OCR processor with language settings."""
@@ -86,27 +91,33 @@ class OCRProcessor:
         
         return image, True
     
-    def extract_text_with_retry(self, image_bytes: bytes, max_retries: int = 2) -> str:
+    def extract_text_with_retry(self, image_bytes: bytes, max_retries: int = 2, item_idx: int = -1) -> str:
         """Extract text from image bytes with retry logic for better reliability."""
         for attempt in range(max_retries):
             try:
-                return self._extract_text_internal(image_bytes, attempt)
+                start_time = time.time()
+                result = self._extract_text_internal(image_bytes, attempt, item_idx)
+                ocr_time = time.time() - start_time
+                Actor.log.debug(f'OCR took {ocr_time:.2f}s for item {item_idx}')
+                return result
             except Exception as e:
                 if attempt == max_retries - 1:
-                    Actor.log.error(f'OCR failed after {max_retries} attempts: {type(e).__name__}: {str(e)}')
+                    Actor.log.error(f'OCR failed after {max_retries} attempts for item {item_idx}: {type(e).__name__}: {str(e)}')
                     return ''
-                Actor.log.debug(f'OCR attempt {attempt + 1} failed, retrying...')
+                Actor.log.debug(f'OCR attempt {attempt + 1} failed for item {item_idx}, retrying...')
                 time.sleep(0.1)  # Brief delay before retry
         return ''
     
-    def _extract_text_internal(self, image_bytes: bytes, attempt: int = 0) -> str:
+    def _extract_text_internal(self, image_bytes: bytes, attempt: int = 0, item_idx: int = -1) -> str:
         """Internal method to extract text from image bytes."""
         try:
+            Actor.log.debug(f'Opening image for item {item_idx} (attempt {attempt + 1})')
             # Open image
             image = Image.open(BytesIO(image_bytes))
             
             # Smart preprocessing
             processed_image, was_preprocessed = self.smart_preprocess(image)
+            Actor.log.debug(f'Image preprocessed: {was_preprocessed} for item {item_idx}')
             
             # Use different configs based on attempt and preprocessing
             if attempt == 0:
@@ -115,31 +126,42 @@ class OCRProcessor:
                 # Try dense text config on retry
                 config = self.dense_config
             
-            # Direct OCR on PIL Image - no file I/O
-            text = pytesseract.image_to_string(
-                processed_image,
-                lang=self.lang,
-                config=config
-            )
+            # Thread-safe OCR with timeout protection
+            Actor.log.debug(f'Starting Tesseract OCR for item {item_idx}')
+            ocr_start = time.time()
+            
+            with TESSERACT_LOCK:
+                # Direct OCR on PIL Image - no file I/O
+                text = pytesseract.image_to_string(
+                    processed_image,
+                    lang=self.lang,
+                    config=config,
+                    timeout=30  # 30 second timeout per OCR operation
+                )
+            
+            ocr_duration = time.time() - ocr_start
+            Actor.log.debug(f'Tesseract completed in {ocr_duration:.2f}s for item {item_idx}')
             
             # Quick validation - if we got very little text and image was not preprocessed, 
             # force preprocessing and try again
             if len(text.strip()) < 10 and not was_preprocessed and attempt == 0:
-                Actor.log.debug('Minimal text detected, forcing preprocessing')
+                Actor.log.debug(f'Minimal text detected for item {item_idx}, forcing preprocessing')
                 # Force preprocessing
                 grayscale = ImageOps.grayscale(processed_image)
                 enhanced = ImageOps.autocontrast(grayscale)
                 
-                text = pytesseract.image_to_string(
-                    enhanced,
-                    lang=self.lang,
-                    config=self.dense_config
-                )
+                with TESSERACT_LOCK:
+                    text = pytesseract.image_to_string(
+                        enhanced,
+                        lang=self.lang,
+                        config=self.dense_config,
+                        timeout=30
+                    )
             
             return text.strip()
             
         except Exception as e:
-            Actor.log.error(f'OCR processing error: {type(e).__name__}: {str(e)}')
+            Actor.log.error(f'OCR processing error for item {item_idx}: {type(e).__name__}: {str(e)}')
             raise
 
 
@@ -157,10 +179,10 @@ async def download_images_batch(
             if response.status_code == 200:
                 return (idx, response.content)
             else:
-                Actor.log.warning(f'Failed to fetch image. Status: {response.status_code}', extra={'url': url})
+                Actor.log.warning(f'Failed to fetch image {idx}. Status: {response.status_code}', extra={'url': url})
                 return (idx, None)
         except Exception as e:
-            Actor.log.warning(f'Error downloading image: {type(e).__name__}: {str(e)}', extra={'url': url[:50]})
+            Actor.log.warning(f'Error downloading image {idx}: {type(e).__name__}: {str(e)}', extra={'url': url[:50]})
             return (idx, None)
     
     async def return_none_with_index(idx: int) -> Tuple[int, None]:
@@ -172,7 +194,7 @@ async def download_images_batch(
         if url and isinstance(url, str):
             tasks.append(download_with_index(start_idx + i, url))
         else:
-            tasks.append(return_none_with_index(start_idx + i)) 
+            tasks.append(return_none_with_index(start_idx + i))
     
     return await asyncio.gather(*tasks)
 
@@ -180,29 +202,42 @@ async def download_images_batch(
 def process_ocr_parallel(
     image_data_list: List[Tuple[int, Optional[bytes]]],
     ocr_processor: OCRProcessor,
-    executor: ThreadPoolExecutor
+    executor: ThreadPoolExecutor,
+    timeout_per_image: int = 60
 ) -> Dict[int, str]:
-    """Process OCR on multiple images in parallel."""
+    """Process OCR on multiple images in parallel with timeout protection."""
     results = {}
     
     # Submit all OCR tasks to thread pool
     future_to_index = {}
     for idx, image_bytes in image_data_list:
         if image_bytes:
-            future = executor.submit(ocr_processor.extract_text_with_retry, image_bytes)
+            Actor.log.debug(f'Submitting OCR task for item {idx}')
+            future = executor.submit(
+                ocr_processor.extract_text_with_retry, 
+                image_bytes, 
+                2,  # max_retries
+                idx  # item_idx for logging
+            )
             future_to_index[future] = idx
         else:
             results[idx] = ''
+            Actor.log.debug(f'No image data for item {idx}')
     
-    # Collect results as they complete
-    for future in as_completed(future_to_index):
+    # Collect results as they complete with timeout
+    completed = 0
+    for future in as_completed(future_to_index, timeout=timeout_per_image * len(future_to_index)):
         idx = future_to_index[future]
         try:
-            ocr_text = future.result()
+            ocr_text = future.result(timeout=timeout_per_image)
             results[idx] = ocr_text
-            Actor.log.debug(f'OCR completed for item {idx}: {len(ocr_text)} chars')
+            completed += 1
+            Actor.log.info(f'OCR completed for item {idx}: {len(ocr_text)} chars ({completed}/{len(future_to_index)})')
+        except TimeoutError:
+            Actor.log.error(f'OCR timeout for item {idx} after {timeout_per_image}s')
+            results[idx] = ''
         except Exception as e:
-            Actor.log.error(f'OCR failed for item {idx}: {e}')
+            Actor.log.error(f'OCR failed for item {idx}: {type(e).__name__}: {e}')
             results[idx] = ''
     
     return results
@@ -250,7 +285,7 @@ async def process_batch_optimized(
             download_time = time.time() - download_start
             Actor.log.debug(f'Downloaded {len(chunk_results)} images in {download_time:.2f}s')
     
-    # Process OCR in parallel
+    # Process OCR in parallel with thread safety
     successful_downloads = sum(1 for _, img in all_image_data if img is not None)
     Actor.log.info(f'Downloaded {successful_downloads}/{len(items)} images. Starting parallel OCR...')
     
@@ -280,7 +315,7 @@ async def process_batch_optimized(
 
 
 async def main() -> None:
-    """Main entry point for the optimized OCR Actor."""
+    """Main entry point for the thread-safe OCR Actor."""
     async with Actor:
         # Get input configuration
         actor_input = await Actor.get_input() or {}
@@ -330,14 +365,22 @@ async def main() -> None:
             
             version = pytesseract.get_tesseract_version()
             Actor.log.info(f'Tesseract version: {version}')
+            
+            # Test Tesseract with a simple operation
+            test_image = Image.new('RGB', (100, 50), color='white')
+            with TESSERACT_LOCK:
+                test_text = pytesseract.image_to_string(test_image, lang=lang, timeout=10)
+            Actor.log.debug('Tesseract test successful')
+            
         except Exception as e:
-            Actor.log.warning(f'Tesseract verification warning: {e}')
+            Actor.log.error(f'Tesseract verification failed: {e}')
+            raise
         
         # Initialize thread pool with configurable workers for parallel OCR
         executor = ThreadPoolExecutor(max_workers=max_workers)
         
         Actor.log.info(f'OCR processor initialized for language: {lang}')
-        Actor.log.info(f'Using {executor._max_workers} parallel OCR workers')
+        Actor.log.info(f'Using {executor._max_workers} parallel OCR workers with thread-safe locking')
         
         total_processed = 0
         start_time = time.time()
