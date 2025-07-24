@@ -184,23 +184,8 @@ async def main() -> None:
         
         # Get dataset info
         info = await source_dataset.get_info()
-        
-        # Debug: log available attributes
-        if info:
-            Actor.log.debug(f'DatasetMetadata attributes: {dir(info)}')
-        
-        # Try to get item count - common patterns are item_count or itemCount
-        item_count = 0
-        if info:
-            if hasattr(info, 'item_count'):
-                item_count = info.item_count
-            elif hasattr(info, 'itemCount'):
-                item_count = info.itemCount
-            elif hasattr(info, 'items_count'):
-                item_count = info.items_count
-            else:
-                # Log warning and continue without item count
-                Actor.log.warning('Could not find item count attribute in dataset info')
+        # The info object has item_count attribute
+        item_count = info.item_count if info else 0
         
         Actor.log.info(f'Found {item_count} items in dataset. Initializing OCR processor...')
         
@@ -236,7 +221,8 @@ async def main() -> None:
                     data_params['clean'] = True
                 
                 result = await source_dataset.get_data(**data_params)
-                batch = result.get('items', [])
+                # Access items attribute directly from the Pydantic model
+                batch = result.items if result and hasattr(result, 'items') else []
                 
                 if not batch:
                     Actor.log.info('All items processed.')
