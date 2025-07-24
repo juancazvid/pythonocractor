@@ -6,7 +6,11 @@ RUN apt-get update && apt-get install -y \
     tesseract-ocr \
     tesseract-ocr-eng \
     tesseract-ocr-spa \
+    tesseract-ocr-osd \
     && rm -rf /var/lib/apt/lists/*
+
+# Set Tesseract to use multiple CPU cores efficiently
+ENV OMP_THREAD_LIMIT=4
 
 # Copy requirements.txt
 COPY requirements.txt ./
