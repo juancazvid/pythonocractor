@@ -1,4 +1,4 @@
-"""OCR text extraction from images in Apify datasets - Conservative stable version."""
+"""OCR text extraction from images in Apify datasets - Optimized with timeout protection."""
 
 from __future__ import annotations
 
@@ -6,55 +6,92 @@ import asyncio
 import os
 import time
 import tempfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import signal
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
+from contextlib import contextmanager
 
 import httpx
 import pytesseract
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageOps
 from apify import Actor
 
 
+@contextmanager
+def timeout(seconds):
+    """Context manager for timeout using signals."""
+    def signal_handler(signum, frame):
+        raise TimeoutError("Timed out!")
+    
+    # Set the signal handler and a timeout alarm
+    signal.signal(signal.SIGALRM, signal_handler)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)  # Disable the alarm
+
+
 class OCRProcessor:
-    """Handles OCR processing with conservative approach for stability."""
+    """Handles OCR processing with timeout protection."""
     
     def __init__(self, lang: str = 'eng'):
         """Initialize OCR processor with language settings."""
         self.lang = lang
-        # Simple config for Spanish text
-        # PSM 3 is more stable than PSM 11
-        self.config = '--psm 3 -c preserve_interword_spaces=1'
+        # Use PSM 3 which seems more stable for your setup
+        self.custom_config = '--psm 3'
     
-    def extract_text(self, image_bytes: bytes, item_idx: int = -1) -> str:
-        """Extract text from image bytes using file-based approach for stability."""
+    def preprocess_image(self, image: Image.Image) -> Image.Image:
+        """Light preprocessing to improve OCR accuracy."""
+        # Resize if too small
+        if image.width < 500:
+            ratio = 500 / image.width
+            new_size = (500, int(image.height * ratio))
+            try:
+                image = image.resize(new_size, Image.Resampling.LANCZOS)
+            except AttributeError:
+                image = image.resize(new_size, Image.LANCZOS)
+        
+        # Convert to RGB
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        return image
+    
+    def extract_text(self, image_bytes: bytes, timeout_seconds: int = 15) -> str:
+        """Extract text from image bytes with timeout protection."""
         try:
-            Actor.log.debug(f'Starting OCR for item {item_idx}, {len(image_bytes)} bytes')
+            Actor.log.debug(f'Starting OCR on {len(image_bytes)} bytes')
             
-            # Open and convert image
+            # Open image
             image = Image.open(BytesIO(image_bytes))
+            Actor.log.debug(f'Image opened: {image.size}, mode: {image.mode}')
             
-            # Convert to RGB (required for JPEG save)
-            if image.mode != 'RGB':
-                image = image.convert('RGB')
+            # Light preprocessing
+            image = self.preprocess_image(image)
             
-            # For Spanish text on Instagram, sometimes saving as file works better
-            # This is slower but more stable
+            # Use temporary file for more stable OCR
             with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp_file:
                 temp_path = tmp_file.name
                 image.save(temp_path, 'JPEG', quality=95)
+                Actor.log.debug(f'Saved temp image to {temp_path}')
                 
                 try:
                     # Perform OCR with timeout
-                    text = pytesseract.image_to_string(
-                        temp_path,
-                        lang=self.lang,
-                        config=self.config,
-                        timeout=30  # 30 second timeout
-                    )
+                    with timeout(timeout_seconds):
+                        text = pytesseract.image_to_string(
+                            temp_path,
+                            lang=self.lang,
+                            config=self.custom_config
+                        )
                     
-                    Actor.log.debug(f'OCR complete for item {item_idx}: {len(text)} chars')
+                    Actor.log.debug(f'OCR complete: extracted {len(text)} characters')
                     return text.strip()
+                    
+                except TimeoutError:
+                    Actor.log.warning(f'OCR timed out after {timeout_seconds}s')
+                    return ''
                     
                 finally:
                     # Clean up temp file
@@ -62,114 +99,123 @@ class OCRProcessor:
                         os.unlink(temp_path)
                         
         except Exception as e:
-            Actor.log.error(f'OCR error for item {item_idx}: {type(e).__name__}: {str(e)}')
+            Actor.log.error(f'OCR processing error: {type(e).__name__}: {str(e)}')
             return ''
 
 
-async def download_images(
-    items: List[Dict[str, Any]],
-    image_field: str
-) -> List[Optional[bytes]]:
-    """Download images with simple sequential approach."""
-    
-    results = []
-    
-    # Use a single client with conservative settings
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        for i, item in enumerate(items):
-            url = item.get(image_field)
-            if url and isinstance(url, str):
-                try:
-                    Actor.log.debug(f'Downloading image {i+1}/{len(items)}')
-                    response = await client.get(url)
-                    if response.status_code == 200:
-                        results.append(response.content)
-                    else:
-                        Actor.log.warning(f'Failed to download image {i+1}: status {response.status_code}')
-                        results.append(None)
-                except Exception as e:
-                    Actor.log.warning(f'Error downloading image {i+1}: {e}')
-                    results.append(None)
-            else:
-                results.append(None)
-    
-    return results
+async def download_image(client: httpx.AsyncClient, url: str) -> Optional[bytes]:
+    """Download image from URL asynchronously."""
+    try:
+        Actor.log.debug(f'Starting download: {url[:50]}...')
+        response = await client.get(url)
+        if response.status_code == 200:
+            content = response.content
+            Actor.log.debug(f'Download successful: {len(content)} bytes')
+            return content
+        else:
+            Actor.log.warning(f'Failed to fetch image. Status: {response.status_code}', extra={'url': url})
+            return None
+    except httpx.TimeoutException:
+        Actor.log.warning(f'Image download timed out', extra={'url': url})
+        return None
+    except Exception as e:
+        Actor.log.warning(f'Error downloading image: {type(e).__name__}: {str(e)}', extra={'url': url})
+        return None
 
 
-async def process_batch_conservative(
+async def process_batch(
     items: List[Dict[str, Any]], 
     image_field: str,
     ocr_processor: OCRProcessor,
-    batch_idx: int = 0
+    executor: ThreadPoolExecutor
 ) -> List[Dict[str, Any]]:
-    """Process a batch with conservative approach - sequential with limited parallelism."""
-    
-    Actor.log.info(f'Processing batch {batch_idx + 1} with {len(items)} items...')
-    start_time = time.time()
-    
-    # Download images
-    Actor.log.info('Downloading images...')
-    download_start = time.time()
-    image_data_list = await download_images(items, image_field)
-    download_time = time.time() - download_start
-    
-    successful_downloads = sum(1 for img in image_data_list if img is not None)
-    Actor.log.info(f'Downloaded {successful_downloads}/{len(items)} images in {download_time:.2f}s')
-    
-    # Process OCR sequentially with some parallelism
+    """Process a batch of items with concurrent image downloading and OCR."""
     results = []
-    ocr_start = time.time()
     
-    # Process in small chunks to avoid overwhelming Tesseract
-    chunk_size = 5  # Process 5 at a time
+    Actor.log.info(f'Starting image downloads for {len(items)} items...')
     
-    for chunk_start in range(0, len(items), chunk_size):
-        chunk_end = min(chunk_start + chunk_size, len(items))
-        chunk_items = items[chunk_start:chunk_end]
-        chunk_images = image_data_list[chunk_start:chunk_end]
-        
-        Actor.log.info(f'Processing OCR for items {chunk_start+1}-{chunk_end}...')
-        
-        # Use thread pool for small chunks
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            futures = []
+    # Download all images concurrently
+    limits = httpx.Limits(max_keepalive_connections=10, max_connections=10)
+    timeout = httpx.Timeout(connect=5.0, read=25.0, write=5.0, pool=5.0)
+    
+    image_bytes_list = []
+    
+    async with httpx.AsyncClient(limits=limits, timeout=timeout) as client:
+        # Process downloads in chunks of 10
+        chunk_size = 10
+        for i in range(0, len(items), chunk_size):
+            chunk_items = items[i:i+chunk_size]
+            chunk_end = min(i+chunk_size, len(items))
+            Actor.log.info(f'Downloading images {i+1}-{chunk_end} of {len(items)}...')
             
-            for i, (item, image_bytes) in enumerate(zip(chunk_items, chunk_images)):
-                idx = chunk_start + i
-                if image_bytes:
-                    future = executor.submit(ocr_processor.extract_text, image_bytes, idx)
-                    futures.append((idx, item, future))
+            download_tasks = []
+            for item in chunk_items:
+                url = item.get(image_field)
+                if url and isinstance(url, str):
+                    Actor.log.debug(f'Queuing download: {url[:50]}...')
+                    download_tasks.append(download_image(client, url))
                 else:
-                    # No image data
-                    new_item = {**item, 'ocrText': ''}
-                    results.append(new_item)
+                    download_tasks.append(asyncio.create_task(asyncio.sleep(0).then(lambda: None)))
             
-            # Collect results
-            for idx, item, future in futures:
-                try:
-                    ocr_text = future.result(timeout=60)
-                    new_item = {**item, 'ocrText': ocr_text}
-                    results.append(new_item)
-                    Actor.log.info(f'OCR completed for item {idx+1}: {len(ocr_text)} chars')
-                except Exception as e:
-                    Actor.log.error(f'OCR failed for item {idx+1}: {e}')
-                    new_item = {**item, 'ocrText': ''}
-                    results.append(new_item)
+            chunk_results = await asyncio.gather(*download_tasks, return_exceptions=True)
+            
+            # Convert exceptions to None
+            chunk_results = [
+                None if isinstance(result, Exception) else result
+                for result in chunk_results
+            ]
+            
+            image_bytes_list.extend(chunk_results)
+        
+        Actor.log.info(f'Downloads complete. Starting OCR processing...')
     
-    ocr_time = time.time() - ocr_start
-    total_time = time.time() - start_time
+    # Process OCR with thread pool
+    successful_downloads = sum(1 for img in image_bytes_list if img is not None)
+    Actor.log.info(f'Successfully downloaded {successful_downloads}/{len(items)} images')
     
-    Actor.log.info(
-        f'Batch {batch_idx + 1} complete. '
-        f'Processed {len(items)} items in {total_time:.2f}s '
-        f'(download: {download_time:.2f}s, OCR: {ocr_time:.2f}s)'
-    )
+    # Submit OCR tasks to thread pool
+    future_to_index = {}
+    for i, (item, image_bytes) in enumerate(zip(items, image_bytes_list)):
+        if image_bytes:
+            Actor.log.debug(f'Submitting OCR task for item {i+1}/{len(items)}')
+            future = executor.submit(ocr_processor.extract_text, image_bytes, 15)  # 15 second timeout
+            future_to_index[future] = i
+        else:
+            # No image data
+            new_item = {**item, 'ocrText': ''}
+            results.append(new_item)
+    
+    # Collect results as they complete
+    completed = 0
+    failed = 0
+    for future in as_completed(future_to_index):
+        index = future_to_index[future]
+        try:
+            ocr_text = future.result(timeout=20)  # Extra buffer for thread pool
+            new_item = {**items[index], 'ocrText': ocr_text}
+            results.append(new_item)
+            completed += 1
+            if ocr_text:
+                Actor.log.debug(f'OCR complete for item {index+1}: {len(ocr_text)} chars')
+            else:
+                Actor.log.warning(f'OCR returned empty for item {index+1}')
+                failed += 1
+        except Exception as e:
+            Actor.log.error(f'OCR failed for item {index+1}: {type(e).__name__}: {str(e)}')
+            new_item = {**items[index], 'ocrText': ''}
+            results.append(new_item)
+            failed += 1
+    
+    # Sort results to maintain order
+    results.sort(key=lambda x: items.index({k: v for k, v in x.items() if k != 'ocrText'}))
+    
+    Actor.log.info(f'Batch processing complete. Processed {len(results)} items, {failed} failed/empty')
     
     return results
 
 
 async def main() -> None:
-    """Main entry point for the conservative OCR Actor."""
+    """Main entry point for the OCR Actor."""
     async with Actor:
         # Get input configuration
         actor_input = await Actor.get_input() or {}
@@ -184,7 +230,8 @@ async def main() -> None:
         lang = actor_input.get('lang', 'eng')
         image_field = actor_input.get('imageUrlFieldName', 'displayUrl')
         process_only_clean = actor_input.get('processOnlyClean', False)
-        batch_size = actor_input.get('batchSize', 50)  # Smaller batches for stability
+        batch_size = actor_input.get('batchSize', 100)  # Reasonable batch size
+        max_workers = actor_input.get('maxWorkers', 3)  # Your tested working value
         
         # Open datasets
         try:
@@ -203,10 +250,10 @@ async def main() -> None:
         
         Actor.log.info(f'Found {item_count} items in dataset. Initializing OCR processor...')
         
-        # Initialize OCR processor
+        # Initialize OCR processor and thread pool
         ocr_processor = OCRProcessor(lang=lang)
         
-        # Verify Tesseract installation
+        # Verify Tesseract is installed
         try:
             import subprocess
             result = subprocess.run(['which', 'tesseract'], capture_output=True, text=True)
@@ -220,24 +267,26 @@ async def main() -> None:
             
             # Test OCR
             test_image = Image.new('RGB', (100, 50), color='white')
-            test_text = pytesseract.image_to_string(test_image, lang=lang, timeout=10)
-            Actor.log.info('Tesseract test successful')
-            
+            test_text = pytesseract.image_to_string(test_image, lang=lang)
+            Actor.log.debug('Tesseract test successful')
+        except pytesseract.TesseractNotFoundError:
+            raise RuntimeError('Tesseract is not installed or not in PATH')
         except Exception as e:
-            Actor.log.error(f'Tesseract verification failed: {e}')
-            raise
+            Actor.log.warning(f'Tesseract test warning: {e}')
+        
+        executor = ThreadPoolExecutor(max_workers=max_workers)
         
         Actor.log.info(f'OCR processor initialized for language: {lang}')
-        Actor.log.info('Using conservative processing approach for stability')
+        Actor.log.info(f'Using {max_workers} parallel workers with timeout protection')
         
         total_processed = 0
+        total_failed = 0
         start_time = time.time()
         
         try:
             # Process dataset in batches
             offset = 0
             batch_idx = 0
-            
             while True:
                 Actor.log.info(f'Fetching batch {batch_idx + 1} (limit: {batch_size}, offset: {offset})...')
                 
@@ -256,36 +305,46 @@ async def main() -> None:
                     Actor.log.info('All items processed.')
                     break
                 
-                # Process batch conservatively
-                processed_items = await process_batch_conservative(
+                Actor.log.info(f'Processing {len(batch)} items...')
+                batch_start = time.time()
+                
+                # Process batch
+                processed_items = await process_batch(
                     batch,
                     image_field,
                     ocr_processor,
-                    batch_idx
+                    executor
                 )
+                
+                # Count failures
+                batch_failed = sum(1 for item in processed_items if not item.get('ocrText', '').strip())
+                total_failed += batch_failed
                 
                 # Push results
                 await default_dataset.push_data(processed_items)
                 
+                batch_time = time.time() - batch_start
                 total_processed += len(processed_items)
-                elapsed_time = time.time() - start_time
-                overall_rate = total_processed / elapsed_time if elapsed_time > 0 else 0
                 
                 Actor.log.info(
-                    f'Progress: {total_processed}/{item_count} items processed. '
-                    f'Overall rate: {overall_rate:.2f} items/sec'
+                    f'Batch {batch_idx + 1} finished in {batch_time:.1f}s. '
+                    f'Total processed: {total_processed}/{item_count} '
+                    f'({batch_failed} failed in this batch, {total_failed} total)'
                 )
                 
                 offset += batch_size
                 batch_idx += 1
                 
         finally:
-            total_time = time.time() - start_time
-            final_rate = total_processed / total_time if total_time > 0 else 0
+            # Clean up
+            executor.shutdown(wait=True)
             
-            Actor.log.info(
-                f'OCR processing completed. '
-                f'Total items: {total_processed}, '
-                f'Total time: {total_time:.2f}s, '
-                f'Average rate: {final_rate:.2f} items/sec'
-            )
+            total_time = time.time() - start_time
+            success_rate = ((total_processed - total_failed) / total_processed * 100) if total_processed > 0 else 0
+            
+            Actor.log.info('OCR processing completed.')
+            Actor.log.info(f'Total processed: {total_processed}')
+            Actor.log.info(f'Total failed/empty: {total_failed}')
+            Actor.log.info(f'Success rate: {success_rate:.1f}%')
+            Actor.log.info(f'Total time: {total_time:.1f}s')
+            Actor.log.info(f'Average: {total_processed/total_time:.2f} items/sec')
