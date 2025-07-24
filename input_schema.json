@@ -40,7 +40,7 @@
       "type": "integer",
       "description": "Number of items to process in each batch. Larger batches are more efficient.",
       "default": 500,
-      "minimum": 50,
+      "minimum": 10,
       "maximum": 1000
     },
     "maxWorkers": {
