@@ -82,17 +82,20 @@ class OCRProcessor:
 async def download_image(client: httpx.AsyncClient, url: str) -> Optional[bytes]:
     """Download image from URL asynchronously."""
     try:
-        response = await client.get(url, timeout=30.0)
+        Actor.log.debug(f'Starting download: {url[:50]}...')
+        response = await client.get(url)  # Timeout is configured at client level
         if response.status_code == 200:
-            return response.content
+            content = response.content
+            Actor.log.debug(f'Download successful: {len(content)} bytes')
+            return content
         else:
             Actor.log.warning(f'Failed to fetch image. Status: {response.status_code}', extra={'url': url})
             return None
     except httpx.TimeoutException:
-        Actor.log.warning(f'Image download timed out after 30 seconds', extra={'url': url})
+        Actor.log.warning(f'Image download timed out', extra={'url': url})
         return None
     except Exception as e:
-        Actor.log.exception(f'Error downloading image: {e}', extra={'url': url})
+        Actor.log.warning(f'Error downloading image: {type(e).__name__}: {str(e)}', extra={'url': url})
         return None
 
 
@@ -109,29 +112,70 @@ async def process_batch(
     async def return_none():
         return None
     
-    # Download all images concurrently
-    # Increase connection pool size for better concurrency
-    limits = httpx.Limits(max_keepalive_connections=20, max_connections=30)
-    async with httpx.AsyncClient(limits=limits) as client:
-        download_tasks = []
-        for item in items:
-            url = item.get(image_field)
-            if url and isinstance(url, str):
-                download_tasks.append(download_image(client, url))
-            else:
-                download_tasks.append(return_none())
+    Actor.log.info(f'Starting image downloads for {len(items)} items...')
+    
+    # Download all images concurrently in chunks to avoid overwhelming
+    # Limit concurrent connections to avoid overwhelming servers
+    limits = httpx.Limits(max_keepalive_connections=10, max_connections=10)
+    # Configure explicit timeouts
+    timeout = httpx.Timeout(
+        connect=5.0,  # 5 seconds to establish connection
+        read=25.0,    # 25 seconds to read response
+        write=5.0,    # 5 seconds to write request
+        pool=5.0      # 5 seconds to acquire connection from pool
+    )
+    
+    image_bytes_list = []
+    
+    async with httpx.AsyncClient(limits=limits, timeout=timeout) as client:
+        # Process downloads in chunks of 10
+        chunk_size = 10
+        for i in range(0, len(items), chunk_size):
+            chunk_items = items[i:i+chunk_size]
+            chunk_end = min(i+chunk_size, len(items))
+            Actor.log.info(f'Downloading images {i+1}-{chunk_end} of {len(items)}...')
+            
+            download_tasks = []
+            for item in chunk_items:
+                url = item.get(image_field)
+                if url and isinstance(url, str):
+                    Actor.log.debug(f'Queuing download: {url[:50]}...')
+                    download_tasks.append(download_image(client, url))
+                else:
+                    download_tasks.append(return_none())
+            
+            try:
+                # Add timeout for chunk downloads (1 minute per chunk)
+                chunk_results = await asyncio.wait_for(
+                    asyncio.gather(*download_tasks, return_exceptions=True),
+                    timeout=60.0
+                )
+                
+                # Convert exceptions to None
+                chunk_results = [
+                    None if isinstance(result, Exception) else result
+                    for result in chunk_results
+                ]
+            except asyncio.TimeoutError:
+                Actor.log.error(f'Chunk {i//chunk_size + 1} download timed out')
+                chunk_results = [None] * len(download_tasks)
+            
+            image_bytes_list.extend(chunk_results)
         
-        # Wait for all downloads to complete concurrently
-        image_bytes_list = await asyncio.gather(*download_tasks)
+        Actor.log.info(f'Downloads complete. Starting OCR processing...')
     
     # Process OCR in thread pool
     loop = asyncio.get_event_loop()
     ocr_tasks = []
     
-    for item, image_bytes in zip(items, image_bytes_list):
+    successful_downloads = sum(1 for img in image_bytes_list if img is not None)
+    Actor.log.info(f'Successfully downloaded {successful_downloads}/{len(items)} images')
+    
+    for i, (item, image_bytes) in enumerate(zip(items, image_bytes_list)):
         new_item = {**item, 'ocrText': ''}
         
         if image_bytes:
+            Actor.log.debug(f'Queuing OCR for item {i}')
             # Run OCR in thread pool
             ocr_task = loop.run_in_executor(
                 executor,
@@ -143,15 +187,20 @@ async def process_batch(
             # No image data, add item as-is
             results.append(new_item)
     
+    Actor.log.info(f'Waiting for {len(ocr_tasks)} OCR tasks to complete...')
+    
     # Wait for all OCR tasks to complete
-    for new_item, ocr_task in ocr_tasks:
+    for i, (new_item, ocr_task) in enumerate(ocr_tasks):
         try:
+            Actor.log.debug(f'Processing OCR task {i+1}/{len(ocr_tasks)}')
             ocr_text = await ocr_task
             new_item['ocrText'] = ocr_text
         except Exception as e:
             Actor.log.exception(f'OCR task failed: {e}')
         
         results.append(new_item)
+    
+    Actor.log.info(f'Batch processing complete. Processed {len(results)} items')
     
     return results
 
@@ -165,9 +214,14 @@ async def main() -> None:
         if not dataset_id:
             raise ValueError('Input error: datasetId is required.')
         
+        # Set debug logging if requested
+        if actor_input.get('debug', False):
+            Actor.log.setLevel('DEBUG')
+        
         lang = actor_input.get('lang', 'eng')
         image_field = actor_input.get('imageUrlFieldName', 'displayUrl')
         process_only_clean = actor_input.get('processOnlyClean', False)
+        batch_size = actor_input.get('batchSize', 500)  # Allow custom batch size
         
         # Open datasets
         try:
@@ -204,7 +258,6 @@ async def main() -> None:
         Actor.log.info(f'OCR processor initialized for language: {lang}')
         
         total_processed = 0
-        batch_size = 30
         
         try:
             # Process dataset in batches
