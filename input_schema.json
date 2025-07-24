@@ -38,10 +38,26 @@
     "batchSize": {
       "title": "Batch Size",
       "type": "integer",
-      "description": "Number of items to process in each batch",
+      "description": "Number of items to process in each batch. Larger batches are more efficient.",
       "default": 500,
-      "minimum": 1,
+      "minimum": 50,
       "maximum": 1000
+    },
+    "maxWorkers": {
+      "title": "Max Parallel OCR Workers",
+      "type": "integer",
+      "description": "Number of parallel OCR workers. More workers = faster processing but more memory usage.",
+      "default": 20,
+      "minimum": 1,
+      "maximum": 50
+    },
+    "downloadChunkSize": {
+      "title": "Download Chunk Size",
+      "type": "integer",
+      "description": "Number of images to download concurrently",
+      "default": 50,
+      "minimum": 10,
+      "maximum": 100
     }
   },
   "required": ["datasetId"]
