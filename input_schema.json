@@ -28,6 +28,20 @@
       "type": "boolean",
       "description": "Only process items classified as 'clean' by Apify",
       "default": false
+    },
+    "debug": {
+      "title": "Debug Mode",
+      "type": "boolean",
+      "description": "Enable debug logging for troubleshooting",
+      "default": false
+    },
+    "batchSize": {
+      "title": "Batch Size",
+      "type": "integer",
+      "description": "Number of items to process in each batch",
+      "default": 500,
+      "minimum": 1,
+      "maximum": 1000
     }
   },
   "required": ["datasetId"]
