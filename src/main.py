@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from typing import Any, Dict, List, Optional
@@ -19,12 +21,8 @@ class OCRProcessor:
     def __init__(self, lang: str = 'eng'):
         """Initialize OCR processor with language settings."""
         self.lang = lang
-        # Configure Tesseract - using default PSM for better multi-line support
-        # Character whitelist is kept for email extraction compatibility
-        self.custom_config = (
-            '-c tessedit_char_whitelist="0123456789abcdefghijklmnopqrstuvwxyz'
-            'ABCDEFGHIJKLMNOPQRSTUVWXYZ@.-_+ \n"'
-        )
+        # Simplified config - remove character whitelist which might be causing issues
+        self.custom_config = '--psm 3'  # Fully automatic page segmentation
     
     def preprocess_image(self, image: Image.Image) -> Image.Image:
         """Apply preprocessing to improve OCR accuracy."""
@@ -53,29 +51,40 @@ class OCRProcessor:
     def extract_text(self, image_bytes: bytes) -> str:
         """Extract text from image bytes."""
         try:
+            Actor.log.debug(f'Starting OCR on {len(image_bytes)} bytes')
+            
             # Open image
             image = Image.open(BytesIO(image_bytes))
+            Actor.log.debug(f'Image opened: {image.size}, mode: {image.mode}')
             
-            # Convert RGBA to RGB if needed
-            if image.mode == 'RGBA':
-                # Create a white background
-                background = Image.new('RGB', image.size, (255, 255, 255))
-                background.paste(image, mask=image.split()[3])  # Use alpha channel as mask
-                image = background
+            # Convert to RGB (Tesseract doesn't handle RGBA well)
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
+                Actor.log.debug(f'Converted image to RGB')
             
-            # Preprocess
-            processed_image = self.preprocess_image(image)
-            
-            # Perform OCR
-            text = pytesseract.image_to_string(
-                processed_image,
-                lang=self.lang,
-                config=self.custom_config
-            )
-            
-            return text.strip()
+            # Use a temporary file for OCR
+            with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp_file:
+                temp_path = tmp_file.name
+                image.save(temp_path, 'JPEG')
+                Actor.log.debug(f'Saved temp image to {temp_path}')
+                
+                try:
+                    # Perform OCR on the file directly
+                    text = pytesseract.image_to_string(
+                        temp_path,
+                        lang=self.lang,
+                        config=self.custom_config
+                    )
+                    
+                    Actor.log.debug(f'OCR complete: extracted {len(text)} characters')
+                    return text.strip()
+                finally:
+                    # Clean up temp file
+                    if os.path.exists(temp_path):
+                        os.unlink(temp_path)
+                        
         except Exception as e:
-            Actor.log.exception(f'OCR processing error: {e}')
+            Actor.log.error(f'OCR processing error: {type(e).__name__}: {str(e)}', exc_info=True)
             return ''
 
 
@@ -164,10 +173,7 @@ async def process_batch(
         
         Actor.log.info(f'Downloads complete. Starting OCR processing...')
     
-    # Process OCR in thread pool
-    loop = asyncio.get_event_loop()
-    ocr_tasks = []
-    
+    # Process OCR synchronously to debug the issue
     successful_downloads = sum(1 for img in image_bytes_list if img is not None)
     Actor.log.info(f'Successfully downloaded {successful_downloads}/{len(items)} images')
     
@@ -175,28 +181,16 @@ async def process_batch(
         new_item = {**item, 'ocrText': ''}
         
         if image_bytes:
-            Actor.log.debug(f'Queuing OCR for item {i}')
-            # Run OCR in thread pool
-            ocr_task = loop.run_in_executor(
-                executor,
-                ocr_processor.extract_text,
-                image_bytes
-            )
-            ocr_tasks.append((new_item, ocr_task))
+            try:
+                Actor.log.debug(f'Processing OCR for item {i+1}/{len(items)}')
+                # Run OCR directly (not in thread pool for now)
+                ocr_text = ocr_processor.extract_text(image_bytes)
+                new_item['ocrText'] = ocr_text
+                Actor.log.debug(f'OCR complete for item {i+1}: {len(ocr_text)} chars')
+            except Exception as e:
+                Actor.log.warning(f'OCR failed for item {i+1}: {type(e).__name__}: {str(e)}')
         else:
-            # No image data, add item as-is
-            results.append(new_item)
-    
-    Actor.log.info(f'Waiting for {len(ocr_tasks)} OCR tasks to complete...')
-    
-    # Wait for all OCR tasks to complete
-    for i, (new_item, ocr_task) in enumerate(ocr_tasks):
-        try:
-            Actor.log.debug(f'Processing OCR task {i+1}/{len(ocr_tasks)}')
-            ocr_text = await ocr_task
-            new_item['ocrText'] = ocr_text
-        except Exception as e:
-            Actor.log.exception(f'OCR task failed: {e}')
+            Actor.log.debug(f'No image data for item {i+1}')
         
         results.append(new_item)
     
@@ -246,14 +240,29 @@ async def main() -> None:
         # Initialize OCR processor and thread pool
         ocr_processor = OCRProcessor(lang=lang)
         
-        # Verify Tesseract is installed
+        # Verify Tesseract is installed and set the path if needed
         try:
+            # Try to find tesseract executable
+            import subprocess
+            result = subprocess.run(['which', 'tesseract'], capture_output=True, text=True)
+            if result.returncode == 0:
+                tesseract_path = result.stdout.strip()
+                Actor.log.info(f'Tesseract found at: {tesseract_path}')
+                pytesseract.pytesseract.tesseract_cmd = tesseract_path
+            
             version = pytesseract.get_tesseract_version()
             Actor.log.info(f'Tesseract version: {version}')
+            
+            # Test OCR with a simple image to verify it's working
+            test_image = Image.new('RGB', (100, 50), color='white')
+            test_text = pytesseract.image_to_string(test_image, lang=lang)
+            Actor.log.debug('Tesseract test successful')
         except pytesseract.TesseractNotFoundError:
             raise RuntimeError('Tesseract is not installed or not in PATH')
+        except Exception as e:
+            Actor.log.warning(f'Tesseract test warning: {e}')
         
-        executor = ThreadPoolExecutor(max_workers=15)  # Increased from JS version's 5
+        executor = ThreadPoolExecutor(max_workers=5)  # Reduced to avoid resource contention
         
         Actor.log.info(f'OCR processor initialized for language: {lang}')
         
